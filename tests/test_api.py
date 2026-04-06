@@ -1,0 +1,110 @@
+import pytest
+from fastapi.testclient import TestClient
+
+import app.api as api_module
+from app.backpressure import BackpressureManager
+from app.main import app
+from app.monitoring import MonitoringService
+from app.queue_manager import TopicQueueManager
+
+
+@pytest.fixture
+def client() -> TestClient:
+    api_module.queue_manager = TopicQueueManager()
+    api_module.monitoring_service = MonitoringService(api_module.queue_manager)
+    api_module.backpressure_manager = BackpressureManager(default_max_queue_depth=100)
+    return TestClient(app)
+
+
+def test_healthcheck(client: TestClient) -> None:
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_dashboard_page_loads(client: TestClient) -> None:
+    response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    assert "Broker Control Panel" in response.text
+
+
+def test_topics_starts_empty(client: TestClient) -> None:
+    response = client.get("/topics")
+
+    assert response.status_code == 200
+    assert response.json() == {"topics": []}
+
+
+def test_create_topic_publish_consume_and_ack_flow(client: TestClient) -> None:
+    create_response = client.post("/topics/orders")
+    publish_response = client.post(
+        "/topics/orders/publish",
+        json={"payload": {"order_id": 1}},
+    )
+    consume_response = client.get("/topics/orders/consume", params={"consumer_id": "c1"})
+
+    assert create_response.status_code == 201
+    assert publish_response.status_code == 201
+    assert consume_response.status_code == 200
+    assert consume_response.json()["message"]["topic"] == "orders"
+
+    message_id = consume_response.json()["message"]["id"]
+    ack_response = client.post(f"/messages/{message_id}/ack")
+    depth_response = client.get("/topics/orders/depth")
+    metrics_response = client.get("/topics/orders/metrics")
+
+    assert ack_response.status_code == 200
+    assert depth_response.json() == {"topic": "orders", "depth": 0}
+    assert metrics_response.status_code == 200
+    assert metrics_response.json()["metrics"]["total_published"] == 1
+    assert metrics_response.json()["metrics"]["total_consumed"] == 1
+    assert metrics_response.json()["metrics"]["total_acked"] == 1
+
+
+def test_consume_returns_clear_result_when_queue_is_empty(client: TestClient) -> None:
+    client.post("/topics/orders")
+
+    response = client.get("/topics/orders/consume")
+
+    assert response.status_code == 200
+    assert response.json()["message"] is None
+    assert response.json()["detail"] == "No messages available."
+
+
+def test_nack_requeues_message_and_updates_metrics(client: TestClient) -> None:
+    client.post("/topics/orders")
+    client.post("/topics/orders/publish", json={"payload": "hello"})
+    consume_response = client.get("/topics/orders/consume")
+
+    message_id = consume_response.json()["message"]["id"]
+    nack_response = client.post(f"/messages/{message_id}/nack")
+    depth_response = client.get("/topics/orders/depth")
+    consume_again_response = client.get("/topics/orders/consume")
+    metrics_response = client.get("/topics/orders/metrics")
+
+    assert nack_response.status_code == 200
+    assert depth_response.json()["depth"] == 1
+    assert consume_again_response.status_code == 200
+    assert consume_again_response.json()["message"]["id"] == message_id
+    assert consume_again_response.json()["message"]["retry_count"] == 1
+    assert metrics_response.json()["metrics"]["total_nacked"] == 1
+    assert metrics_response.json()["metrics"]["total_retries"] == 1
+
+
+def test_publish_returns_429_when_backpressure_is_triggered(client: TestClient) -> None:
+    api_module.backpressure_manager = BackpressureManager(default_max_queue_depth=1)
+
+    client.post("/topics/orders")
+    first_publish = client.post("/topics/orders/publish", json={"payload": "first"})
+    second_publish = client.post("/topics/orders/publish", json={"payload": "second"})
+
+    assert first_publish.status_code == 201
+    assert second_publish.status_code == 429
+
+
+def test_publish_returns_404_for_missing_topic(client: TestClient) -> None:
+    response = client.post("/topics/missing/publish", json={"payload": "hello"})
+
+    assert response.status_code == 404
