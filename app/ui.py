@@ -377,6 +377,7 @@ DASHBOARD_HTML = """
             <button class="btn-secondary" id="listTopicsBtn">Refresh Topics</button>
             <button class="btn-neutral" id="depthBtn">Check Depth</button>
             <button class="btn-neutral" id="metricsBtn">Refresh Metrics</button>
+            <button class="btn-neutral" id="deadLetterBtn">View DLQ</button>
           </div>
           <p class="hint">Tip: create the topic once, then use the same topic name for publish and consume.</p>
         </div>
@@ -417,7 +418,12 @@ DASHBOARD_HTML = """
             <div class="metric"><small>Total Consumed</small><strong id="metricConsumed">0</strong></div>
             <div class="metric"><small>Total Acked</small><strong id="metricAcked">0</strong></div>
             <div class="metric"><small>Total Nacked</small><strong id="metricNacked">0</strong></div>
+            <div class="metric"><small>Dead-Lettered</small><strong id="metricDeadLettered">0</strong></div>
             <div class="metric"><small>Total Retries</small><strong id="metricRetries">0</strong></div>
+            <div class="metric"><small>Retry Limit</small><strong id="metricRetryLimit">0</strong></div>
+            <div class="metric"><small>Avg Latency (ms)</small><strong id="metricLatency">0</strong></div>
+            <div class="metric"><small>Success Rate</small><strong id="metricSuccessRate">0%</strong></div>
+            <div class="metric"><small>Burst Status</small><strong id="metricBurst">NORMAL</strong></div>
             <div class="metric"><small>Message Rate</small><strong id="metricRate">0</strong></div>
             <div class="metric"><small>Byte Throughput</small><strong id="metricBytes">0</strong></div>
           </div>
@@ -429,6 +435,11 @@ DASHBOARD_HTML = """
         <div class="panel section">
           <h2>Topics</h2>
           <pre id="topicsView">[]</pre>
+        </div>
+
+        <div class="panel section">
+          <h2>Dead-Letter Queue</h2>
+          <pre id="deadLetterView">[]</pre>
         </div>
 
         <div class="panel section">
@@ -445,6 +456,7 @@ DASHBOARD_HTML = """
     const payloadInput = document.getElementById("payload");
     const lastMessageView = document.getElementById("lastMessage");
     const topicsView = document.getElementById("topicsView");
+    const deadLetterView = document.getElementById("deadLetterView");
     const activityLog = document.getElementById("activityLog");
     const backpressureState = document.getElementById("backpressureState");
 
@@ -530,6 +542,7 @@ DASHBOARD_HTML = """
       log(`Topic ready: ${data.topic} (${data.detail})`);
       await refreshTopics();
       await refreshMetrics();
+      await refreshDeadLetter();
     }
 
     async function refreshTopics() {
@@ -590,6 +603,7 @@ DASHBOARD_HTML = """
       lastMessageView.textContent = "Last message acknowledged.";
       updateMessageButtons();
       await refreshMetrics();
+      await refreshDeadLetter();
     }
 
     async function nackLast() {
@@ -605,9 +619,10 @@ DASHBOARD_HTML = """
       log(data.detail);
       state.lastMessageId = null;
       state.lastMessage = null;
-      lastMessageView.textContent = "Last message requeued by nack.";
+      lastMessageView.textContent = data.detail;
       updateMessageButtons();
       await refreshMetrics();
+      await refreshDeadLetter();
     }
 
     async function refreshDepth() {
@@ -622,22 +637,37 @@ DASHBOARD_HTML = """
       const data = await requestJson(`/topics/${encodeURIComponent(topic)}/metrics`);
       const metrics = data.metrics;
       const backpressure = data.backpressure;
+      const retryPolicy = data.retry_policy;
 
       setMetric("metricDepth", metrics.current_queue_depth);
       setMetric("metricPublished", metrics.total_published);
       setMetric("metricConsumed", metrics.total_consumed);
       setMetric("metricAcked", metrics.total_acked);
       setMetric("metricNacked", metrics.total_nacked);
+      setMetric("metricDeadLettered", metrics.total_dead_lettered);
       setMetric("metricRetries", metrics.total_retries);
+      setMetric("metricRetryLimit", retryPolicy.max_retries);
+      setMetric("metricLatency", metrics.average_delivery_latency_ms);
+      setMetric("metricSuccessRate", `${Math.round(metrics.delivery_success_rate * 100)}%`);
+      setMetric("metricBurst", metrics.burst_detected ? "BURST" : "NORMAL");
       setMetric("metricRate", metrics.message_rate);
       setMetric("metricBytes", metrics.byte_throughput);
 
       backpressureState.textContent =
         `Backpressure: ${backpressure.throttled ? "THROTTLED" : "ACCEPTING"} | ` +
         `queue_depth=${backpressure.queue_depth} | ` +
-        `max_queue_depth=${backpressure.max_queue_depth}`;
+        `max_queue_depth=${backpressure.max_queue_depth} | ` +
+        `dead_letter_count=${retryPolicy.dead_letter_count} | ` +
+        `burst_threshold=${metrics.burst_threshold_messages_per_second} msg/s`;
 
       log(`Metrics refreshed for topic '${topic}'.`);
+    }
+
+    async function refreshDeadLetter() {
+      const topic = currentTopic();
+      const data = await requestJson(`/topics/${encodeURIComponent(topic)}/dead-letter`);
+      deadLetterView.textContent = JSON.stringify(data.messages, null, 2);
+      log(`Dead-letter queue refreshed for topic '${topic}' (${data.count} messages).`);
     }
 
     async function safeRun(action) {
@@ -656,6 +686,7 @@ DASHBOARD_HTML = """
     document.getElementById("nackBtn").addEventListener("click", () => safeRun(nackLast));
     document.getElementById("depthBtn").addEventListener("click", () => safeRun(refreshDepth));
     document.getElementById("metricsBtn").addEventListener("click", () => safeRun(refreshMetrics));
+    document.getElementById("deadLetterBtn").addEventListener("click", () => safeRun(refreshDeadLetter));
 
     updateMessageButtons();
     refreshTopics().catch(() => {});

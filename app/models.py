@@ -17,6 +17,7 @@ class MessageStatus(str, Enum):
     QUEUED = "queued"
     IN_FLIGHT = "in_flight"
     ACKED = "acked"
+    DEAD_LETTER = "dead_letter"
 
 
 class Message(BaseModel):
@@ -84,6 +85,7 @@ class TopicMetrics:
     acked_count: int = 0
     nacked_count: int = 0
     requeued_count: int = 0
+    dead_lettered_count: int = 0
 
 
 @dataclass(slots=True)
@@ -91,6 +93,7 @@ class TopicState:
     name: str
     ready_queue: deque[Message] = field(default_factory=deque)
     inflight: dict[str, DeliveryRecord] = field(default_factory=dict)
+    dead_letter_queue: deque[Message] = field(default_factory=deque)
     metrics: TopicMetrics = field(default_factory=TopicMetrics)
 
     @property
@@ -100,3 +103,7 @@ class TopicState:
     @property
     def inflight_count(self) -> int:
         return len(self.inflight)
+
+    @property
+    def dead_letter_count(self) -> int:
+        return len(self.dead_letter_queue)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import RedirectResponse
 
@@ -13,7 +15,7 @@ from app.queue_manager import (
 )
 
 
-queue_manager = QueueManager()
+queue_manager = QueueManager(max_retries=2)
 monitoring_service = MonitoringService(queue_manager)
 backpressure_manager = BackpressureManager(default_max_queue_depth=100)
 
@@ -25,7 +27,7 @@ def read_root() -> dict[str, object]:
     return {
         "service": "lightweight-message-broker",
         "status": "ready",
-        "docs": "/docs",
+        "docs": "/api/docs",
         "dashboard": "/dashboard",
     }
 
@@ -121,9 +123,13 @@ def ack_message(message_id: str) -> ActionResponse:
     except MessageNotInFlightError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
+    latency_seconds = (
+        datetime.now(timezone.utc) - message.timestamp
+    ).total_seconds()
     monitoring_service.record_ack(
         topic=message.topic,
         queue_depth=queue_manager.get_queue_depth(message.topic),
+        latency_seconds=latency_seconds,
     )
     return ActionResponse(success=True, detail=f"Message '{message_id}' acknowledged.")
 
@@ -131,14 +137,27 @@ def ack_message(message_id: str) -> ActionResponse:
 @router.post("/messages/{message_id}/nack", response_model=ActionResponse)
 def nack_message(message_id: str) -> ActionResponse:
     try:
-        message = queue_manager.nack(message_id)
+        result = queue_manager.nack(message_id)
     except MessageNotInFlightError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     monitoring_service.record_nack(
-        topic=message.topic,
-        queue_depth=queue_manager.get_queue_depth(message.topic),
+        topic=result.message.topic,
+        queue_depth=queue_manager.get_queue_depth(result.message.topic),
+        retried=result.requeued,
     )
+    if result.dead_lettered:
+        monitoring_service.record_dead_letter(
+            topic=result.message.topic,
+            queue_depth=queue_manager.get_queue_depth(result.message.topic),
+        )
+        return ActionResponse(
+            success=True,
+            detail=(
+                f"Message '{message_id}' reached retry limit and was moved to the dead-letter queue."
+            ),
+        )
+
     return ActionResponse(success=True, detail=f"Message '{message_id}' requeued.")
 
 
@@ -162,6 +181,10 @@ def topic_metrics(topic: str) -> dict[str, object]:
             topic_name,
             topic_state.queue_depth,
         ),
+        "retry_policy": {
+            "max_retries": queue_manager.max_retries,
+            "dead_letter_count": queue_manager.get_dead_letter_count(topic_name),
+        },
     }
 
 
@@ -174,6 +197,19 @@ def topic_stats(topic: str) -> dict[str, object]:
 @router.get("/metrics")
 def metrics() -> dict[str, dict[str, int | str]]:
     return monitoring_service.snapshot_all()
+
+
+@router.get("/topics/{topic}/dead-letter")
+def topic_dead_letter(topic: str) -> dict[str, object]:
+    topic_name = _validate_topic_name(topic)
+    _require_existing_topic(topic_name)
+
+    messages = [message.model_dump(mode="json") for message in queue_manager.get_dead_letter_messages(topic_name)]
+    return {
+        "topic": topic_name,
+        "count": len(messages),
+        "messages": messages,
+    }
 
 
 def _validate_topic_name(topic: str) -> str:

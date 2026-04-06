@@ -64,16 +64,40 @@ def test_nack_requeues_message_and_increases_retry_count() -> None:
     manager.enqueue("orders", build_message("msg-1", "orders"))
     manager.dequeue("orders")
 
-    message = manager.nack("msg-1")
+    result = manager.nack("msg-1")
     topic_state = manager.get_topic("orders")
 
-    assert message.retry_count == 1
-    assert message.status == MessageStatus.QUEUED
+    assert result.requeued is True
+    assert result.dead_lettered is False
+    assert result.message.retry_count == 1
+    assert result.message.status == MessageStatus.QUEUED
     assert "msg-1" not in topic_state.inflight
     assert manager.get_queue_depth("orders") == 1
     assert topic_state.ready_queue[-1].id == "msg-1"
     assert topic_state.metrics.nacked_count == 1
     assert topic_state.metrics.requeued_count == 1
+
+
+def test_nack_moves_message_to_dead_letter_queue_after_retry_limit() -> None:
+    manager = TopicQueueManager(max_retries=1)
+    manager.create_topic("orders")
+    manager.enqueue("orders", build_message("msg-1", "orders"))
+
+    manager.dequeue("orders")
+    first_result = manager.nack("msg-1")
+    manager.dequeue("orders")
+    second_result = manager.nack("msg-1")
+    topic_state = manager.get_topic("orders")
+
+    assert first_result.requeued is True
+    assert second_result.requeued is False
+    assert second_result.dead_lettered is True
+    assert second_result.message.retry_count == 2
+    assert second_result.message.status == MessageStatus.DEAD_LETTER
+    assert manager.get_queue_depth("orders") == 0
+    assert topic_state.dead_letter_count == 1
+    assert topic_state.dead_letter_queue[-1].id == "msg-1"
+    assert topic_state.metrics.dead_lettered_count == 1
 
 
 def test_missing_topic_operations_raise_clear_error() -> None:

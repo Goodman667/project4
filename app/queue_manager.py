@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -18,12 +19,25 @@ class MessageNotInFlightError(TopicQueueError):
     """Raised when ack/nack targets a message that is not in flight."""
 
 
+@dataclass(slots=True)
+class NackResult:
+    """Result returned after nack to describe the next message state."""
+
+    message: Message
+    requeued: bool
+    dead_lettered: bool
+
+
 class TopicQueueManager:
     """Simple in-memory FIFO queue manager grouped by topic."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_retries: int = 2) -> None:
+        if max_retries < 0:
+            raise ValueError("max_retries must be greater than or equal to 0.")
+
         self._topics: dict[str, TopicState] = {}
         self._inflight_index: dict[str, str] = {}
+        self.max_retries = max_retries
 
     def create_topic(self, topic: str) -> TopicState:
         topic_name = self._validate_topic_name(topic)
@@ -77,20 +91,42 @@ class TopicQueueManager:
         topic_state.metrics.acked_count += 1
         return record.message
 
-    def nack(self, message_id: str) -> Message:
+    def nack(self, message_id: str) -> NackResult:
         topic_state, record = self._pop_inflight_record(message_id)
         message = record.message
         message.retry_count += 1
-        message.status = MessageStatus.QUEUED
 
-        topic_state.ready_queue.append(message)
         topic_state.metrics.nacked_count += 1
+        if message.retry_count > self.max_retries:
+            message.status = MessageStatus.DEAD_LETTER
+            topic_state.dead_letter_queue.append(message)
+            topic_state.metrics.dead_lettered_count += 1
+            return NackResult(
+                message=message,
+                requeued=False,
+                dead_lettered=True,
+            )
+
+        message.status = MessageStatus.QUEUED
+        topic_state.ready_queue.append(message)
         topic_state.metrics.requeued_count += 1
-        return message
+        return NackResult(
+            message=message,
+            requeued=True,
+            dead_lettered=False,
+        )
 
     def get_queue_depth(self, topic: str) -> int:
         topic_state = self._require_topic(topic)
         return topic_state.queue_depth
+
+    def get_dead_letter_messages(self, topic: str) -> list[Message]:
+        topic_state = self._require_topic(topic)
+        return list(topic_state.dead_letter_queue)
+
+    def get_dead_letter_count(self, topic: str) -> int:
+        topic_state = self._require_topic(topic)
+        return topic_state.dead_letter_count
 
     def publish(self, topic: str, payload: Any) -> Message:
         """Small helper for the next API step."""

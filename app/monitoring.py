@@ -25,9 +25,11 @@ class TopicMonitoringState:
     total_consumed: int = 0
     total_acked: int = 0
     total_nacked: int = 0
+    total_dead_lettered: int = 0
     total_retries: int = 0
     bytes_received: int = 0
     current_queue_depth: int = 0
+    total_ack_latency_seconds: float = 0.0
     recent_publish_events: deque[PublishEvent] = field(default_factory=deque)
 
 
@@ -44,12 +46,18 @@ class MonitoringService:
         self,
         queue_manager: QueueManager | None = None,
         rate_window_seconds: int = 60,
+        burst_threshold_messages_per_second: float = 0.1,
     ) -> None:
         if rate_window_seconds <= 0:
             raise ValueError("rate_window_seconds must be greater than 0.")
+        if burst_threshold_messages_per_second < 0:
+            raise ValueError(
+                "burst_threshold_messages_per_second must be greater than or equal to 0."
+            )
 
         self.queue_manager = queue_manager
         self.rate_window_seconds = rate_window_seconds
+        self.burst_threshold_messages_per_second = burst_threshold_messages_per_second
         self._topics: dict[str, TopicMonitoringState] = {}
 
     def ensure_topic(self, topic: str) -> TopicMonitoringState:
@@ -103,10 +111,13 @@ class MonitoringService:
         topic: str,
         queue_depth: int | None = None,
         timestamp: float | None = None,
+        latency_seconds: float | None = None,
     ) -> None:
         topic_name = self._validate_topic_name(topic)
         state = self.ensure_topic(topic_name)
         state.total_acked += 1
+        if latency_seconds is not None:
+            state.total_ack_latency_seconds += max(0.0, latency_seconds)
         if queue_depth is not None:
             state.current_queue_depth = self._normalize_depth(queue_depth)
         self._trim_old_events(state, self._resolve_time(timestamp))
@@ -116,16 +127,31 @@ class MonitoringService:
         topic: str,
         queue_depth: int | None = None,
         timestamp: float | None = None,
+        retried: bool = True,
     ) -> None:
         topic_name = self._validate_topic_name(topic)
         state = self.ensure_topic(topic_name)
         state.total_nacked += 1
-        state.total_retries += 1
+        if retried:
+            state.total_retries += 1
         state.current_queue_depth = (
             self._normalize_depth(queue_depth)
             if queue_depth is not None
             else state.current_queue_depth + 1
         )
+        self._trim_old_events(state, self._resolve_time(timestamp))
+
+    def record_dead_letter(
+        self,
+        topic: str,
+        queue_depth: int | None = None,
+        timestamp: float | None = None,
+    ) -> None:
+        topic_name = self._validate_topic_name(topic)
+        state = self.ensure_topic(topic_name)
+        state.total_dead_lettered += 1
+        if queue_depth is not None:
+            state.current_queue_depth = self._normalize_depth(queue_depth)
         self._trim_old_events(state, self._resolve_time(timestamp))
 
     def set_queue_depth(self, topic: str, depth: int) -> None:
@@ -179,6 +205,19 @@ class MonitoringService:
         window_bytes = sum(event.byte_size for event in state.recent_publish_events)
         message_rate = round(window_message_count / self.rate_window_seconds, 3)
         byte_throughput = round(window_bytes / self.rate_window_seconds, 3)
+        average_delivery_latency_ms = 0.0
+        if state.total_acked:
+            average_delivery_latency_ms = round(
+                (state.total_ack_latency_seconds / state.total_acked) * 1000,
+                3,
+            )
+
+        completion_count = state.total_acked + state.total_dead_lettered
+        delivery_success_rate = 0.0
+        if completion_count:
+            delivery_success_rate = round(state.total_acked / completion_count, 3)
+
+        burst_detected = message_rate >= self.burst_threshold_messages_per_second
 
         return {
             "topic": topic,
@@ -186,11 +225,16 @@ class MonitoringService:
             "total_consumed": state.total_consumed,
             "total_acked": state.total_acked,
             "total_nacked": state.total_nacked,
+            "total_dead_lettered": state.total_dead_lettered,
             "total_retries": state.total_retries,
             "bytes_received": state.bytes_received,
             "current_queue_depth": state.current_queue_depth,
+            "average_delivery_latency_ms": average_delivery_latency_ms,
+            "delivery_success_rate": delivery_success_rate,
             "message_rate": message_rate,
             "byte_throughput": byte_throughput,
+            "burst_detected": burst_detected,
+            "burst_threshold_messages_per_second": self.burst_threshold_messages_per_second,
         }
 
     def _trim_old_events(self, state: TopicMonitoringState, now: float) -> None:
