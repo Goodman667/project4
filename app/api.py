@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import RedirectResponse
 
 from app.backpressure import BackpressureManager
 from app.models import ActionResponse, PublishMessageRequest, PublishMessageResponse
@@ -32,6 +33,21 @@ def read_root() -> dict[str, object]:
 @router.get("/health")
 def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@router.get("/api/health")
+def api_healthcheck() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@router.get("/docs", include_in_schema=False)
+def docs_redirect() -> RedirectResponse:
+    return RedirectResponse(url="/api/docs", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+
+
+@router.get("/redoc", include_in_schema=False)
+def redoc_redirect() -> RedirectResponse:
+    return RedirectResponse(url="/api/redoc", status_code=status.HTTP_307_TEMPORARY_REDIRECT)
 
 
 @router.post("/topics/{topic}", status_code=status.HTTP_201_CREATED)

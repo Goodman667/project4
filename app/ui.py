@@ -347,7 +347,7 @@ DASHBOARD_HTML = """
           <strong>Swagger Docs</strong>
           <span>Open the raw API documentation when you need endpoint details.</span>
         </a>
-        <a class="link-card" href="/health" target="_blank" rel="noreferrer">
+        <a class="link-card" href="/api/health" target="_blank" rel="noreferrer">
           <strong>Health Check</strong>
           <span>Quickly verify the service is running before the demo starts.</span>
         </a>

@@ -23,6 +23,20 @@ def test_healthcheck(client: TestClient) -> None:
     assert response.json() == {"status": "ok"}
 
 
+def test_api_healthcheck_alias(client: TestClient) -> None:
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_docs_redirects_to_api_docs(client: TestClient) -> None:
+    response = client.get("/docs", follow_redirects=False)
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "/api/docs"
+
+
 def test_dashboard_page_loads(client: TestClient) -> None:
     response = client.get("/dashboard")
 
